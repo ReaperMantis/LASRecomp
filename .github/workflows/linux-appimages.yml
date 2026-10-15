@@ -1,0 +1,102 @@
+# Linux AppImages: x86_64 + aarch64 (cross-compiled), built in the project's own
+# Ubuntu 22.04 containers so the results run on glibc 2.35+ distributions.
+#
+# The runner itself provides almost nothing. Every build dependency is resolved
+# inside the build containers driven by `make appimage ARCH=<arch>`:
+#   - tools/linux/Containerfile (Ubuntu 22.04 image): clang 21 + lld 21 from
+#     apt.llvm.org (22.04's clang 15 lacks __builtin_elementwise_* used by the
+#     lifted FP code), Python 3.12 from deadsnakes, cmake/ninja/nasm, and the
+#     X11 / Wayland / ALSA / Pulse / PipeWire / Vulkan dev headers.
+#   - tools/linux/build_deps.sh, from pinned sources: SDL3 3.4.16, LGPL-only
+#     FFmpeg 9.0.2, shaderc 2026.3, Vulkan headers 1.4.350.1, VMA 3.3.0.
+#   - tools/linux/package.sh: the Zig toolchain (tools/fetch_zig.sh, what the
+#     start screen uses to build the game code on the player's machine),
+#     appimagetool 1.9.1 and the AppImage type-2 runtime.
+#   - tools/linux/rando_helper.sh: the PyInstaller-frozen seed generator and
+#     game-code generator helpers (in a container of the target's own arch).
+# No game files are included or needed; the AppImage contains no game code.
+name: Linux AppImages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  appimage:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+
+    concurrency:
+      group: linux-appimage-${{ matrix.arch }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune -af >/dev/null 2>&1 || true
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman
+
+      # aarch64 is cross-compiled in the amd64 container, but its PyInstaller
+      # helper step runs in an arm64 container, which needs QEMU user emulation.
+      # The binfmt handlers this registers are kernel-wide, so podman containers
+      # can use them; the F ("fix-binary") flag lets them work inside containers.
+      - name: Register QEMU binfmt handlers (arm64)
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # The Containerfile build (apt + deadsnakes + llvm-21, done once per arch;
+      # slow under QEMU for arm64) is cached so only changed layers rebuild.
+      - name: Cache the build container images
+        id: images
+        uses: actions/cache@v4
+        with:
+          path: lasrecomp-build-images.tar
+          key: lasrecomp-build-images-${{ matrix.arch }}-${{ hashFiles('tools/linux/Containerfile') }}
+
+      - name: Restore the build container images
+        if: steps.images.outputs.cache-hit == 'true'
+        run: |
+          podman load -i lasrecomp-build-images.tar
+          rm -f lasrecomp-build-images.tar
+
+      # Builds both images (amd64 always; arm64 too when ARCH=aarch64), then:
+      # aarch64: freezes the seed generator helper in the arm64 container (QEMU),
+      #          cross-compiles the app against the arm64 image's root filesystem
+      # x86_64:  builds natively in the amd64 container
+      # Output: build/dist/LAS_Recomp-<version>-<arch>.AppImage
+      - name: Build the AppImage
+        run: make appimage ARCH=${{ matrix.arch }}
+
+      - name: Export the build container images for the cache
+        if: steps.images.outputs.cache-hit != 'true'
+        run: |
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            podman save -o lasrecomp-build-images.tar \
+              localhost/lasrecomp-build:amd64 localhost/lasrecomp-build:arm64
+          else
+            podman save -o lasrecomp-build-images.tar localhost/lasrecomp-build:amd64
+          fi
+
+      - name: Upload the AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAS_Recomp-${{ matrix.arch }}-AppImage
+          path: build/dist/*.AppImage
+          if-no-files-found: error
