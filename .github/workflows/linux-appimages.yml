@@ -19,7 +19,7 @@ name: Linux AppImages
 
 on:
   push:
-    branches: [main]
+    branches: [github-workflow-linux]
   pull_request:
   workflow_dispatch:
 
